@@ -343,9 +343,7 @@ async function createShopifyPage({
   title,
   handle,
   body,
-  metaTitle = "",
-  metaDescription = "",
-  isPublished = false
+  isPublished = true
 }) {
   const mutation = `
     mutation CreatePage($page: PageCreateInput!) {
@@ -370,13 +368,6 @@ async function createShopifyPage({
     body,
     isPublished
   };
-
-  if (metaTitle || metaDescription) {
-    pageInput.seo = {
-      title: metaTitle,
-      description: metaDescription
-    };
-  }
 
   const variables = {
     page: pageInput
@@ -541,13 +532,13 @@ app.get("/admin/test-create-page", requireAdminSecret, async (req, res) => {
       title: "Pagina test SEO Generator",
       handle: `pagina-test-seo-generator-${Date.now()}`,
       body:
-        "<h1>Pagina test SEO Generator</h1><p>Questa è una pagina di test creata automaticamente dall'app SEO Page Generator.</p>",
-      isPublished: false
+        "<h1>Pagina test SEO Generator</h1><p>Questa è una pagina di test pubblicata automaticamente dall'app SEO Page Generator.</p>",
+      isPublished: true
     });
 
     res.json({
       status: "ok",
-      message: "Test creazione pagina eseguito",
+      message: "Test creazione pagina pubblicata eseguito",
       page
     });
   } catch (error) {
@@ -641,7 +632,7 @@ app.get("/admin/keywords", requireAdminSecret, async (req, res) => {
                 </td>
                 <td>
                   <form method="POST" action="/admin/keywords/${row.id}/generate?secret=${ADMIN_SECRET}">
-                    <button type="submit">Genera pagina</button>
+                    <button type="submit">Genera e pubblica pagina</button>
                   </form>
                 </td>
               </tr>
@@ -685,11 +676,7 @@ app.post("/admin/keywords", requireAdminSecret, async (req, res) => {
         )
         VALUES ($1, $2, NULL, NULL, $3, 'da_generare')
         `,
-        [
-          cleanKeyword,
-          titleFromKeyword(cleanKeyword),
-          DEFAULT_INTERNAL_URL
-        ]
+        [cleanKeyword, titleFromKeyword(cleanKeyword), DEFAULT_INTERNAL_URL]
       );
     }
 
@@ -742,11 +729,7 @@ app.post("/admin/keywords/bulk", requireAdminSecret, async (req, res) => {
         )
         VALUES ($1, $2, NULL, NULL, $3, 'da_generare')
         `,
-        [
-          keyword,
-          titleFromKeyword(keyword),
-          DEFAULT_INTERNAL_URL
-        ]
+        [keyword, titleFromKeyword(keyword), DEFAULT_INTERNAL_URL]
       );
 
       inserted++;
@@ -810,9 +793,7 @@ app.post("/admin/keywords/:id/generate", requireAdminSecret, async (req, res) =>
       title: generated.title,
       handle: `${generated.handle}-${Date.now()}`,
       body: generated.html_body,
-      metaTitle: generated.meta_title,
-      metaDescription: generated.meta_description,
-      isPublished: false
+      isPublished: true
     });
 
     const shopifyUrl = `https://${cleanShop(SHOPIFY_STORE_DOMAIN)}/pages/${
@@ -823,7 +804,7 @@ app.post("/admin/keywords/:id/generate", requireAdminSecret, async (req, res) =>
       `
       UPDATE seo_keywords
       SET
-        stato = 'bozza_generata',
+        stato = 'pubblicata',
         shopify_page_id = $1,
         shopify_url = $2,
         errore = null,
