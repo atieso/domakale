@@ -26,24 +26,53 @@ function requireAdminSecret(req, res, next) {
 }
 
 async function getShopifyAccessToken() {
-  const url = `https://${SHOPIFY_STORE_DOMAIN}/admin/oauth/access_token`;
+  const cleanShopDomain = SHOPIFY_STORE_DOMAIN
+    .replace("https://", "")
+    .replace("http://", "")
+    .replace("/", "")
+    .trim();
+
+  const url = `https://${cleanShopDomain}/admin/oauth/access_token`;
+
+  const body = new URLSearchParams();
+  body.append("client_id", SHOPIFY_CLIENT_ID);
+  body.append("client_secret", SHOPIFY_CLIENT_SECRET);
+  body.append("grant_type", "client_credentials");
 
   const response = await fetch(url, {
     method: "POST",
     headers: {
-      "Content-Type": "application/json"
+      "Content-Type": "application/x-www-form-urlencoded",
+      "Accept": "application/json"
     },
-    body: JSON.stringify({
-      client_id: SHOPIFY_CLIENT_ID,
-      client_secret: SHOPIFY_CLIENT_SECRET,
-      grant_type: "client_credentials"
-    })
+    body
   });
 
-  const data = await response.json();
+  const text = await response.text();
+
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new Error(
+      JSON.stringify({
+        status: response.status,
+        statusText: response.statusText,
+        url,
+        contentType: response.headers.get("content-type"),
+        rawPreview: text.slice(0, 500)
+      })
+    );
+  }
 
   if (!response.ok) {
-    throw new Error(JSON.stringify(data));
+    throw new Error(
+      JSON.stringify({
+        status: response.status,
+        statusText: response.statusText,
+        response: data
+      })
+    );
   }
 
   return data.access_token;
