@@ -3,6 +3,7 @@ import dotenv from "dotenv";
 import crypto from "crypto";
 import pg from "pg";
 import OpenAI from "openai";
+import cron from "node-cron";
 
 dotenv.config();
 
@@ -22,7 +23,11 @@ const {
   DATABASE_URL,
   MIN_CONTENT_LENGTH,
   OPENAI_API_KEY,
-  OPENAI_MODEL
+  OPENAI_MODEL,
+  DAILY_PAGE_LIMIT,
+  HOURLY_PAGE_LIMIT,
+  AUTO_PUBLISH_ENABLED,
+  CRON_MINUTE
 } = process.env;
 
 const APP_URL = "https://domakale.onrender.com";
@@ -47,6 +52,8 @@ const pool = new Pool({
 const openai = new OpenAI({
   apiKey: OPENAI_API_KEY
 });
+
+let publisherRunning = false;
 
 function cleanShop(shop) {
   return String(shop || "")
@@ -97,6 +104,36 @@ function escapeHtml(text) {
     .replaceAll("'", "&#039;");
 }
 
+function nowInRomeSql() {
+  const parts = new Intl.DateTimeFormat("it-IT", {
+    timeZone: "Europe/Rome",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false
+  }).formatToParts(new Date());
+
+  const map = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+
+  return `${map.year}-${map.month}-${map.day} ${map.hour}:${map.minute}:${map.second}`;
+}
+
+function todayRomeDate() {
+  const parts = new Intl.DateTimeFormat("it-IT", {
+    timeZone: "Europe/Rome",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).formatToParts(new Date());
+
+  const map = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+
+  return `${map.year}-${map.month}-${map.day}`;
+}
+
 function verifyShopifyHmac(query) {
   const { hmac, signature, ...rest } = query;
 
@@ -143,6 +180,46 @@ async function initDb() {
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
   `);
+
+  await pool.query(`
+    ALTER TABLE seo_keywords
+    ADD COLUMN IF NOT EXISTS published_at TIMESTAMP;
+  `);
+}
+
+async function getTodayPublishedCount() {
+  const today = todayRomeDate();
+
+  const result = await pool.query(
+    `
+    SELECT COUNT(*)::int AS count
+    FROM seo_keywords
+    WHERE stato = 'pubblicata'
+      AND published_at::date = $1::date
+    `,
+    [today]
+  );
+
+  return Number(result.rows[0]?.count || 0);
+}
+
+async function getDashboardStats() {
+  const todayPublished = await getTodayPublishedCount();
+
+  const result = await pool.query(`
+    SELECT
+      COUNT(*)::int AS total,
+      COUNT(*) FILTER (WHERE stato = 'da_generare')::int AS da_generare,
+      COUNT(*) FILTER (WHERE stato = 'in_generazione')::int AS in_generazione,
+      COUNT(*) FILTER (WHERE stato = 'pubblicata')::int AS pubblicata,
+      COUNT(*) FILTER (WHERE stato = 'errore')::int AS errore
+    FROM seo_keywords
+  `);
+
+  return {
+    ...result.rows[0],
+    todayPublished
+  };
 }
 
 async function shopifyGraphql(query, variables = {}) {
@@ -339,12 +416,7 @@ function validateGeneratedPage(generated) {
   return true;
 }
 
-async function createShopifyPage({
-  title,
-  handle,
-  body,
-  isPublished = true
-}) {
+async function createShopifyPage({ title, handle, body, isPublished = true }) {
   const mutation = `
     mutation CreatePage($page: PageCreateInput!) {
       pageCreate(page: $page) {
@@ -381,6 +453,180 @@ async function createShopifyPage({
   }
 
   return result.page;
+}
+
+async function generateAndPublishKeyword(keywordRow) {
+  const id = keywordRow.id;
+
+  await pool.query(
+    `
+    UPDATE seo_keywords
+    SET stato = 'in_generazione',
+        errore = null,
+        updated_at = CURRENT_TIMESTAMP
+    WHERE id = $1
+    `,
+    [id]
+  );
+
+  const generated = await generateSeoPageWithOpenAI(keywordRow);
+
+  validateGeneratedPage(generated);
+
+  const page = await createShopifyPage({
+    title: generated.title,
+    handle: `${generated.handle}-${Date.now()}`,
+    body: generated.html_body,
+    isPublished: true
+  });
+
+  const shopifyUrl = `https://${cleanShop(SHOPIFY_STORE_DOMAIN)}/pages/${page.handle}`;
+  const publishedAt = nowInRomeSql();
+
+  await pool.query(
+    `
+    UPDATE seo_keywords
+    SET
+      stato = 'pubblicata',
+      shopify_page_id = $1,
+      shopify_url = $2,
+      errore = null,
+      published_at = $3,
+      updated_at = CURRENT_TIMESTAMP
+    WHERE id = $4
+    `,
+    [page.id, shopifyUrl, publishedAt, id]
+  );
+
+  return page;
+}
+
+async function runHourlyPublisher() {
+  if (publisherRunning) {
+    console.log("Publisher già in esecuzione. Salto questo ciclo.");
+    return {
+      total: 0,
+      published: 0,
+      failed: 0,
+      skipped: true,
+      reason: "Publisher già in esecuzione"
+    };
+  }
+
+  publisherRunning = true;
+
+  try {
+    const dailyLimit = Number(DAILY_PAGE_LIMIT || 100);
+    const hourlyLimit = Number(HOURLY_PAGE_LIMIT || 10);
+
+    const alreadyPublishedToday = await getTodayPublishedCount();
+    const remainingToday = Math.max(dailyLimit - alreadyPublishedToday, 0);
+    const batchLimit = Math.min(hourlyLimit, remainingToday);
+
+    console.log(`Pubblicate oggi: ${alreadyPublishedToday}/${dailyLimit}`);
+    console.log(`Limite orario: ${hourlyLimit}`);
+    console.log(`Batch corrente: ${batchLimit}`);
+
+    if (batchLimit <= 0) {
+      console.log("Limite giornaliero raggiunto. Nessuna pubblicazione.");
+      return {
+        total: 0,
+        published: 0,
+        failed: 0,
+        skipped: true,
+        reason: "Limite giornaliero raggiunto"
+      };
+    }
+
+    const result = await pool.query(
+      `
+      SELECT *
+      FROM seo_keywords
+      WHERE stato = 'da_generare'
+      ORDER BY id ASC
+      LIMIT $1
+      `,
+      [batchLimit]
+    );
+
+    const keywords = result.rows;
+
+    console.log(`Keyword da pubblicare in questo batch: ${keywords.length}`);
+
+    let published = 0;
+    let failed = 0;
+
+    for (const keywordRow of keywords) {
+      try {
+        console.log(`Genero keyword ID ${keywordRow.id}: ${keywordRow.keyword}`);
+
+        await generateAndPublishKeyword(keywordRow);
+
+        published++;
+
+        console.log(`Pubblicata keyword ID ${keywordRow.id}`);
+      } catch (error) {
+        failed++;
+
+        console.error(`Errore keyword ID ${keywordRow.id}:`, error.message);
+
+        await pool.query(
+          `
+          UPDATE seo_keywords
+          SET
+            stato = 'errore',
+            errore = $1,
+            updated_at = CURRENT_TIMESTAMP
+          WHERE id = $2
+          `,
+          [error.message, keywordRow.id]
+        );
+      }
+    }
+
+    console.log(
+      `Batch completato. Elaborate: ${keywords.length}. Pubblicate: ${published}. Errori: ${failed}.`
+    );
+
+    return {
+      total: keywords.length,
+      published,
+      failed,
+      skipped: false
+    };
+  } finally {
+    publisherRunning = false;
+  }
+}
+
+function setupHourlyCron() {
+  const enabled = String(AUTO_PUBLISH_ENABLED || "false").toLowerCase() === "true";
+
+  if (!enabled) {
+    console.log("Pubblicazione automatica disattivata.");
+    return;
+  }
+
+  const minute = Number(CRON_MINUTE || 0);
+  const safeMinute = Math.min(Math.max(minute, 0), 59);
+
+  const cronExpression = `${safeMinute} * * * *`;
+
+  cron.schedule(
+    cronExpression,
+    async () => {
+      try {
+        await runHourlyPublisher();
+      } catch (error) {
+        console.error("Errore generale cron orario:", error.message);
+      }
+    },
+    {
+      timezone: "Europe/Rome"
+    }
+  );
+
+  console.log(`Cron orario attivo: ${cronExpression} Europe/Rome`);
 }
 
 app.get("/", (req, res) => {
@@ -552,6 +798,8 @@ app.get("/admin/test-create-page", requireAdminSecret, async (req, res) => {
 
 app.get("/admin/keywords", requireAdminSecret, async (req, res) => {
   try {
+    const stats = await getDashboardStats();
+
     const result = await pool.query(`
       SELECT *
       FROM seo_keywords
@@ -561,6 +809,9 @@ app.get("/admin/keywords", requireAdminSecret, async (req, res) => {
 
     const rows = result.rows;
 
+    const dailyLimit = Number(DAILY_PAGE_LIMIT || 100);
+    const hourlyLimit = Number(HOURLY_PAGE_LIMIT || 10);
+
     res.send(`
       <html>
         <head>
@@ -568,6 +819,23 @@ app.get("/admin/keywords", requireAdminSecret, async (req, res) => {
         </head>
         <body style="font-family: Arial, sans-serif; padding: 40px;">
           <h1>Keyword SEO Generator</h1>
+
+          <div style="padding: 16px; border: 1px solid #ddd; margin-bottom: 30px; max-width: 900px;">
+            <h2>Stato pubblicazione</h2>
+            <p><strong>Pubblicate oggi:</strong> ${stats.todayPublished} / ${dailyLimit}</p>
+            <p><strong>Massimo per ora:</strong> ${hourlyLimit}</p>
+            <p><strong>Totale keyword:</strong> ${stats.total}</p>
+            <p><strong>Da generare:</strong> ${stats.da_generare}</p>
+            <p><strong>In generazione:</strong> ${stats.in_generazione}</p>
+            <p><strong>Pubblicate totali:</strong> ${stats.pubblicata}</p>
+            <p><strong>Errori:</strong> ${stats.errore}</p>
+
+            <form method="POST" action="/admin/run-hourly-publisher?secret=${ADMIN_SECRET}" style="margin-top: 20px;">
+              <button type="submit" style="padding: 10px 18px; font-weight: bold;">
+                Avvia ora batch massimo ${hourlyLimit} pagine
+              </button>
+            </form>
+          </div>
 
           <h2>Aggiungi una keyword</h2>
 
@@ -774,45 +1042,7 @@ app.post("/admin/keywords/:id/generate", requireAdminSecret, async (req, res) =>
 
     const keywordRow = result.rows[0];
 
-    await pool.query(
-      `
-      UPDATE seo_keywords
-      SET stato = 'in_generazione',
-          errore = null,
-          updated_at = CURRENT_TIMESTAMP
-      WHERE id = $1
-      `,
-      [id]
-    );
-
-    const generated = await generateSeoPageWithOpenAI(keywordRow);
-
-    validateGeneratedPage(generated);
-
-    const page = await createShopifyPage({
-      title: generated.title,
-      handle: `${generated.handle}-${Date.now()}`,
-      body: generated.html_body,
-      isPublished: true
-    });
-
-    const shopifyUrl = `https://${cleanShop(SHOPIFY_STORE_DOMAIN)}/pages/${
-      page.handle
-    }`;
-
-    await pool.query(
-      `
-      UPDATE seo_keywords
-      SET
-        stato = 'pubblicata',
-        shopify_page_id = $1,
-        shopify_url = $2,
-        errore = null,
-        updated_at = CURRENT_TIMESTAMP
-      WHERE id = $3
-      `,
-      [page.id, shopifyUrl, id]
-    );
+    await generateAndPublishKeyword(keywordRow);
 
     res.redirect(`/admin/keywords?secret=${ADMIN_SECRET}`);
   } catch (error) {
@@ -834,10 +1064,58 @@ app.post("/admin/keywords/:id/generate", requireAdminSecret, async (req, res) =>
   }
 });
 
+app.post("/admin/run-hourly-publisher", requireAdminSecret, async (req, res) => {
+  try {
+    const result = await runHourlyPublisher();
+
+    res.send(`
+      <html>
+        <head>
+          <title>Batch pubblicazione completato</title>
+        </head>
+        <body style="font-family: Arial, sans-serif; padding: 40px;">
+          <h1>Batch pubblicazione completato</h1>
+          <p><strong>Keyword elaborate:</strong> ${result.total}</p>
+          <p><strong>Pagine pubblicate:</strong> ${result.published}</p>
+          <p><strong>Errori:</strong> ${result.failed}</p>
+          <p><strong>Saltato:</strong> ${result.skipped ? "Sì" : "No"}</p>
+          ${result.reason ? `<p><strong>Motivo:</strong> ${escapeHtml(result.reason)}</p>` : ""}
+
+          <p>
+            <a href="/admin/keywords?secret=${ADMIN_SECRET}">
+              Torna alla gestione keyword
+            </a>
+          </p>
+        </body>
+      </html>
+    `);
+  } catch (error) {
+    res.status(500).send(`Errore batch pubblicazione: ${escapeHtml(error.message)}`);
+  }
+});
+
+app.get("/admin/cron-publish", requireAdminSecret, async (req, res) => {
+  try {
+    const result = await runHourlyPublisher();
+
+    res.json({
+      status: "ok",
+      result
+    });
+  } catch (error) {
+    res.status(500).json({
+      status: "error",
+      message: error.message
+    });
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 
 initDb()
   .then(() => {
+    setupHourlyCron();
+
     app.listen(PORT, () => {
       console.log(`App attiva sulla porta ${PORT}`);
     });
