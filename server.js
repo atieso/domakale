@@ -27,6 +27,8 @@ const {
 
 const APP_URL = "https://domakale.onrender.com";
 
+const DEFAULT_INTERNAL_URL = "/collections/all";
+
 const SCOPES = [
   "read_content",
   "write_content",
@@ -73,6 +75,17 @@ function slugify(text) {
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "")
     .substring(0, 90);
+}
+
+function titleFromKeyword(keyword) {
+  return String(keyword || "")
+    .trim()
+    .split(/\s+/)
+    .map((word) => {
+      if (word.length <= 2) return word.toLowerCase();
+      return word.charAt(0).toUpperCase() + word.slice(1).toLowerCase();
+    })
+    .join(" ");
 }
 
 function escapeHtml(text) {
@@ -169,10 +182,8 @@ async function generateSeoPageWithOpenAI(keywordRow) {
   }
 
   const keyword = keywordRow.keyword;
-  const titoloPagina = keywordRow.titolo_pagina || keywordRow.keyword;
-  const categoria = keywordRow.categoria || "";
-  const citta = keywordRow.citta || "";
-  const urlTarget = keywordRow.url_target || "/collections/all";
+  const titoloPagina = keywordRow.titolo_pagina || titleFromKeyword(keyword);
+  const urlTarget = keywordRow.url_target || DEFAULT_INTERNAL_URL;
 
   const minLength = Number(MIN_CONTENT_LENGTH || 3000);
   const targetLength = Math.max(minLength + 600, 3600);
@@ -182,8 +193,6 @@ Genera una pagina SEO-oriented per Shopify basata sulla keyword: "${keyword}".
 
 Dati disponibili:
 - Titolo pagina suggerito: "${titoloPagina}"
-- Categoria: "${categoria}"
-- Città/località: "${citta}"
 - Link interno target: "${urlTarget}"
 
 Requisiti:
@@ -556,7 +565,7 @@ app.get("/admin/keywords", requireAdminSecret, async (req, res) => {
       SELECT *
       FROM seo_keywords
       ORDER BY id DESC
-      LIMIT 100
+      LIMIT 300
     `);
 
     const rows = result.rows;
@@ -569,36 +578,37 @@ app.get("/admin/keywords", requireAdminSecret, async (req, res) => {
         <body style="font-family: Arial, sans-serif; padding: 40px;">
           <h1>Keyword SEO Generator</h1>
 
-          <h2>Aggiungi keyword</h2>
+          <h2>Aggiungi una keyword</h2>
 
           <form method="POST" action="/admin/keywords?secret=${ADMIN_SECRET}">
             <p>
               <label>Keyword</label><br>
-              <input name="keyword" style="width: 500px;" required>
-            </p>
-
-            <p>
-              <label>Titolo pagina</label><br>
-              <input name="titolo_pagina" style="width: 500px;">
-            </p>
-
-            <p>
-              <label>Categoria</label><br>
-              <input name="categoria" style="width: 500px;">
-            </p>
-
-            <p>
-              <label>Città</label><br>
-              <input name="citta" style="width: 500px;">
-            </p>
-
-            <p>
-              <label>URL target interno</label><br>
-              <input name="url_target" value="/collections/all" style="width: 500px;">
+              <input name="keyword" style="width: 600px;" required>
             </p>
 
             <button type="submit">Salva keyword</button>
           </form>
+
+          <hr style="margin: 40px 0;">
+
+          <h2>Incolla elenco keyword</h2>
+
+          <p>Inserisci una keyword per riga. Il sistema salverà ogni riga come keyword separata.</p>
+
+          <form method="POST" action="/admin/keywords/bulk?secret=${ADMIN_SECRET}">
+            <p>
+              <label>Elenco keyword</label><br>
+              <textarea 
+                name="keywords_bulk" 
+                style="width: 700px; height: 240px;" 
+                placeholder="tende per hotel vicenza&#10;tende oscuranti per alberghi&#10;tende ignifughe per hotel"
+                required></textarea>
+            </p>
+
+            <button type="submit">Salva elenco keyword</button>
+          </form>
+
+          <hr style="margin: 40px 0;">
 
           <h2>Keyword salvate</h2>
 
@@ -606,7 +616,6 @@ app.get("/admin/keywords", requireAdminSecret, async (req, res) => {
             <tr>
               <th>ID</th>
               <th>Keyword</th>
-              <th>Titolo pagina</th>
               <th>Stato</th>
               <th>URL Shopify</th>
               <th>Errore</th>
@@ -619,7 +628,6 @@ app.get("/admin/keywords", requireAdminSecret, async (req, res) => {
               <tr>
                 <td>${row.id}</td>
                 <td>${escapeHtml(row.keyword)}</td>
-                <td>${escapeHtml(row.titolo_pagina || "")}</td>
                 <td>${escapeHtml(row.stato)}</td>
                 <td>
                   ${
@@ -628,7 +636,7 @@ app.get("/admin/keywords", requireAdminSecret, async (req, res) => {
                       : "-"
                   }
                 </td>
-                <td style="max-width: 300px;">
+                <td style="max-width: 360px; font-size: 12px;">
                   ${row.errore ? escapeHtml(row.errore) : "-"}
                 </td>
                 <td>
@@ -651,34 +659,121 @@ app.get("/admin/keywords", requireAdminSecret, async (req, res) => {
 
 app.post("/admin/keywords", requireAdminSecret, async (req, res) => {
   try {
-    const { keyword, titolo_pagina, categoria, citta, url_target } = req.body;
+    const { keyword } = req.body;
 
-    await pool.query(
-      `
-      INSERT INTO seo_keywords (
-        keyword,
-        titolo_pagina,
-        categoria,
-        citta,
-        url_target,
-        stato
-      )
-      VALUES ($1, $2, $3, $4, $5, 'da_generare')
-      `,
-      [
-        keyword,
-        titolo_pagina || null,
-        categoria || null,
-        citta || null,
-        url_target || "/collections/all"
-      ]
+    if (!keyword || !keyword.trim()) {
+      return res.status(400).send("Keyword mancante.");
+    }
+
+    const cleanKeyword = keyword.trim();
+
+    const existing = await pool.query(
+      `SELECT id FROM seo_keywords WHERE LOWER(keyword) = LOWER($1) LIMIT 1`,
+      [cleanKeyword]
     );
+
+    if (existing.rows.length === 0) {
+      await pool.query(
+        `
+        INSERT INTO seo_keywords (
+          keyword,
+          titolo_pagina,
+          categoria,
+          citta,
+          url_target,
+          stato
+        )
+        VALUES ($1, $2, NULL, NULL, $3, 'da_generare')
+        `,
+        [
+          cleanKeyword,
+          titleFromKeyword(cleanKeyword),
+          DEFAULT_INTERNAL_URL
+        ]
+      );
+    }
 
     res.redirect(`/admin/keywords?secret=${ADMIN_SECRET}`);
   } catch (error) {
     res
       .status(500)
       .send(`Errore salvataggio keyword: ${escapeHtml(error.message)}`);
+  }
+});
+
+app.post("/admin/keywords/bulk", requireAdminSecret, async (req, res) => {
+  try {
+    const { keywords_bulk } = req.body;
+
+    if (!keywords_bulk || !keywords_bulk.trim()) {
+      return res.status(400).send("Nessuna keyword inserita.");
+    }
+
+    const lines = keywords_bulk
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean);
+
+    const uniqueKeywords = [...new Set(lines)];
+
+    let inserted = 0;
+    let skipped = 0;
+
+    for (const keyword of uniqueKeywords) {
+      const existing = await pool.query(
+        `SELECT id FROM seo_keywords WHERE LOWER(keyword) = LOWER($1) LIMIT 1`,
+        [keyword]
+      );
+
+      if (existing.rows.length > 0) {
+        skipped++;
+        continue;
+      }
+
+      await pool.query(
+        `
+        INSERT INTO seo_keywords (
+          keyword,
+          titolo_pagina,
+          categoria,
+          citta,
+          url_target,
+          stato
+        )
+        VALUES ($1, $2, NULL, NULL, $3, 'da_generare')
+        `,
+        [
+          keyword,
+          titleFromKeyword(keyword),
+          DEFAULT_INTERNAL_URL
+        ]
+      );
+
+      inserted++;
+    }
+
+    res.send(`
+      <html>
+        <head>
+          <title>Import keyword completato</title>
+        </head>
+        <body style="font-family: Arial, sans-serif; padding: 40px;">
+          <h1>Import keyword completato</h1>
+          <p><strong>Keyword inserite:</strong> ${inserted}</p>
+          <p><strong>Keyword duplicate saltate:</strong> ${skipped}</p>
+
+          <p>
+            <a href="/admin/keywords?secret=${ADMIN_SECRET}">
+              Torna alla gestione keyword
+            </a>
+          </p>
+        </body>
+      </html>
+    `);
+  } catch (error) {
+    res
+      .status(500)
+      .send(`Errore import keyword: ${escapeHtml(error.message)}`);
   }
 });
 
