@@ -257,7 +257,7 @@ app.get("/admin/test-create-page", requireAdminSecret, async (req, res) => {
         title: "Pagina test SEO Generator",
         handle: `pagina-test-seo-generator-${Date.now()}`,
         body: "<h1>Pagina test SEO Generator</h1><p>Questa è una pagina di test creata automaticamente dall'app SEO Page Generator.</p>",
-        isPublished: false
+        isPublished: true
       }
     };
 
