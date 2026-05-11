@@ -31,7 +31,6 @@ const {
 } = process.env;
 
 const APP_URL = "https://domakale.onrender.com";
-
 const DEFAULT_INTERNAL_URL = "/collections/all";
 
 const SCOPES = [
@@ -434,15 +433,13 @@ async function createShopifyPage({ title, handle, body, isPublished = true }) {
     }
   `;
 
-  const pageInput = {
-    title,
-    handle,
-    body,
-    isPublished
-  };
-
   const variables = {
-    page: pageInput
+    page: {
+      title,
+      handle,
+      body,
+      isPublished
+    }
   };
 
   const data = await shopifyGraphql(mutation, variables);
@@ -523,12 +520,7 @@ async function runHourlyPublisher() {
     const remainingToday = Math.max(dailyLimit - alreadyPublishedToday, 0);
     const batchLimit = Math.min(hourlyLimit, remainingToday);
 
-    console.log(`Pubblicate oggi: ${alreadyPublishedToday}/${dailyLimit}`);
-    console.log(`Limite orario: ${hourlyLimit}`);
-    console.log(`Batch corrente: ${batchLimit}`);
-
     if (batchLimit <= 0) {
-      console.log("Limite giornaliero raggiunto. Nessuna pubblicazione.");
       return {
         total: 0,
         published: 0,
@@ -550,8 +542,6 @@ async function runHourlyPublisher() {
     );
 
     const keywords = result.rows;
-
-    console.log(`Keyword da pubblicare in questo batch: ${keywords.length}`);
 
     let published = 0;
     let failed = 0;
@@ -583,10 +573,6 @@ async function runHourlyPublisher() {
         );
       }
     }
-
-    console.log(
-      `Batch completato. Elaborate: ${keywords.length}. Pubblicate: ${published}. Errori: ${failed}.`
-    );
 
     return {
       total: keywords.length,
@@ -800,17 +786,76 @@ app.get("/admin/keywords", requireAdminSecret, async (req, res) => {
   try {
     const stats = await getDashboardStats();
 
-    const result = await pool.query(`
+    const allowedStatuses = [
+      "tutte",
+      "da_generare",
+      "in_generazione",
+      "pubblicata",
+      "errore"
+    ];
+
+    const selectedStatus = allowedStatuses.includes(req.query.stato)
+      ? req.query.stato
+      : "tutte";
+
+    const page = Math.max(parseInt(req.query.page || "1", 10), 1);
+    const perPage = Math.min(
+      Math.max(parseInt(req.query.limit || "50", 10), 10),
+      100
+    );
+
+    const offset = (page - 1) * perPage;
+
+    let countQuery = `
+      SELECT COUNT(*)::int AS total
+      FROM seo_keywords
+    `;
+
+    let listQuery = `
       SELECT *
       FROM seo_keywords
+    `;
+
+    const queryParams = [];
+
+    if (selectedStatus !== "tutte") {
+      countQuery += ` WHERE stato = $1`;
+      listQuery += ` WHERE stato = $1`;
+      queryParams.push(selectedStatus);
+    }
+
+    listQuery += `
       ORDER BY id DESC
-      LIMIT 300
-    `);
+      LIMIT $${queryParams.length + 1}
+      OFFSET $${queryParams.length + 2}
+    `;
+
+    const countResult = await pool.query(countQuery, queryParams);
+    const totalRows = Number(countResult.rows[0]?.total || 0);
+    const totalPages = Math.max(Math.ceil(totalRows / perPage), 1);
+
+    const result = await pool.query(listQuery, [
+      ...queryParams,
+      perPage,
+      offset
+    ]);
 
     const rows = result.rows;
 
     const dailyLimit = Number(DAILY_PAGE_LIMIT || 100);
     const hourlyLimit = Number(HOURLY_PAGE_LIMIT || 10);
+
+    function paginationUrl(targetPage) {
+      return `/admin/keywords?secret=${encodeURIComponent(
+        ADMIN_SECRET
+      )}&stato=${encodeURIComponent(selectedStatus)}&page=${targetPage}&limit=${perPage}`;
+    }
+
+    function statusUrl(status) {
+      return `/admin/keywords?secret=${encodeURIComponent(
+        ADMIN_SECRET
+      )}&stato=${encodeURIComponent(status)}&page=1&limit=${perPage}`;
+    }
 
     res.send(`
       <html>
@@ -871,6 +916,54 @@ app.get("/admin/keywords", requireAdminSecret, async (req, res) => {
 
           <h2>Keyword salvate</h2>
 
+          <div style="margin-bottom: 20px; padding: 12px; background: #f7f7f7; border: 1px solid #ddd; max-width: 900px;">
+            <strong>Filtro stato:</strong>
+
+            <a href="${statusUrl("tutte")}" style="margin-left: 10px; ${selectedStatus === "tutte" ? "font-weight: bold;" : ""}">
+              Tutte
+            </a>
+
+            <a href="${statusUrl("da_generare")}" style="margin-left: 10px; ${selectedStatus === "da_generare" ? "font-weight: bold;" : ""}">
+              Da generare
+            </a>
+
+            <a href="${statusUrl("in_generazione")}" style="margin-left: 10px; ${selectedStatus === "in_generazione" ? "font-weight: bold;" : ""}">
+              In generazione
+            </a>
+
+            <a href="${statusUrl("pubblicata")}" style="margin-left: 10px; ${selectedStatus === "pubblicata" ? "font-weight: bold;" : ""}">
+              Pubblicate
+            </a>
+
+            <a href="${statusUrl("errore")}" style="margin-left: 10px; ${selectedStatus === "errore" ? "font-weight: bold;" : ""}">
+              Errori
+            </a>
+          </div>
+
+          <div style="margin-bottom: 20px;">
+            <p>
+              <strong>Risultati filtro:</strong> ${totalRows} keyword |
+              <strong>Pagina:</strong> ${page} di ${totalPages} |
+              <strong>Mostrate per pagina:</strong> ${perPage}
+            </p>
+
+            <div style="display: flex; gap: 10px; align-items: center;">
+              ${
+                page > 1
+                  ? `<a href="${paginationUrl(page - 1)}">← Precedente</a>`
+                  : `<span style="color: #999;">← Precedente</span>`
+              }
+
+              <span>Pagina ${page} / ${totalPages}</span>
+
+              ${
+                page < totalPages
+                  ? `<a href="${paginationUrl(page + 1)}">Successiva →</a>`
+                  : `<span style="color: #999;">Successiva →</span>`
+              }
+            </div>
+          </div>
+
           <table border="1" cellpadding="8" cellspacing="0">
             <tr>
               <th>ID</th>
@@ -881,33 +974,63 @@ app.get("/admin/keywords", requireAdminSecret, async (req, res) => {
               <th>Azione</th>
             </tr>
 
-            ${rows
-              .map(
-                (row) => `
-              <tr>
-                <td>${row.id}</td>
-                <td>${escapeHtml(row.keyword)}</td>
-                <td>${escapeHtml(row.stato)}</td>
-                <td>
-                  ${
-                    row.shopify_url
-                      ? `<a href="${row.shopify_url}" target="_blank">Apri</a>`
-                      : "-"
-                  }
-                </td>
-                <td style="max-width: 360px; font-size: 12px;">
-                  ${row.errore ? escapeHtml(row.errore) : "-"}
-                </td>
-                <td>
-                  <form method="POST" action="/admin/keywords/${row.id}/generate?secret=${ADMIN_SECRET}">
-                    <button type="submit">Genera e pubblica pagina</button>
-                  </form>
-                </td>
-              </tr>
-            `
-              )
-              .join("")}
+            ${
+              rows.length === 0
+                ? `
+                  <tr>
+                    <td colspan="6">Nessuna keyword trovata per questo filtro.</td>
+                  </tr>
+                `
+                : rows
+                    .map(
+                      (row) => `
+                <tr>
+                  <td>${row.id}</td>
+                  <td>${escapeHtml(row.keyword)}</td>
+                  <td>${escapeHtml(row.stato)}</td>
+                  <td>
+                    ${
+                      row.shopify_url
+                        ? `<a href="${row.shopify_url}" target="_blank">Apri</a>`
+                        : "-"
+                    }
+                  </td>
+                  <td style="max-width: 360px; font-size: 12px;">
+                    ${row.errore ? escapeHtml(row.errore) : "-"}
+                  </td>
+                  <td>
+                    ${
+                      row.stato === "pubblicata"
+                        ? `<span style="color: green;">Completata</span>`
+                        : `
+                          <form method="POST" action="/admin/keywords/${row.id}/generate?secret=${ADMIN_SECRET}">
+                            <button type="submit">Genera e pubblica pagina</button>
+                          </form>
+                        `
+                    }
+                  </td>
+                </tr>
+              `
+                    )
+                    .join("")
+            }
           </table>
+
+          <div style="margin-top: 20px;">
+            ${
+              page > 1
+                ? `<a href="${paginationUrl(page - 1)}">← Precedente</a>`
+                : `<span style="color: #999;">← Precedente</span>`
+            }
+
+            <span style="margin: 0 12px;">Pagina ${page} / ${totalPages}</span>
+
+            ${
+              page < totalPages
+                ? `<a href="${paginationUrl(page + 1)}">Successiva →</a>`
+                : `<span style="color: #999;">Successiva →</span>`
+            }
+          </div>
         </body>
       </html>
     `);
