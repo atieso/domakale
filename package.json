@@ -1,0 +1,13 @@
+{
+  "name": "shopify-seo-generator",
+  "version": "1.0.0",
+  "description": "SEO Page Generator for Shopify",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
