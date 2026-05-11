@@ -20,8 +20,6 @@ const SCOPES = [
   "write_content",
   "read_online_store_pages",
   "write_online_store_pages",
-  "read_metafields",
-  "write_metafields",
   "read_products"
 ].join(",");
 
