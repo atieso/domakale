@@ -2,12 +2,14 @@ import express from "express";
 import dotenv from "dotenv";
 import crypto from "crypto";
 import pg from "pg";
+import OpenAI from "openai";
 
 dotenv.config();
 
 const { Pool } = pg;
 
 const app = express();
+
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
@@ -18,7 +20,9 @@ const {
   SHOPIFY_ADMIN_ACCESS_TOKEN,
   ADMIN_SECRET,
   DATABASE_URL,
-  MIN_CONTENT_LENGTH
+  MIN_CONTENT_LENGTH,
+  OPENAI_API_KEY,
+  OPENAI_MODEL
 } = process.env;
 
 const APP_URL = "https://domakale.onrender.com";
@@ -36,6 +40,10 @@ const pool = new Pool({
   ssl: {
     rejectUnauthorized: false
   }
+});
+
+const openai = new OpenAI({
+  apiKey: OPENAI_API_KEY
 });
 
 function cleanShop(shop) {
@@ -83,7 +91,10 @@ function verifyShopifyHmac(query) {
 
   const message = Object.keys(rest)
     .sort()
-    .map((key) => `${key}=${Array.isArray(rest[key]) ? rest[key].join(",") : rest[key]}`)
+    .map((key) => {
+      const value = Array.isArray(rest[key]) ? rest[key].join(",") : rest[key];
+      return `${key}=${value}`;
+    })
     .join("&");
 
   const generatedHash = crypto
@@ -91,10 +102,14 @@ function verifyShopifyHmac(query) {
     .update(message)
     .digest("hex");
 
-  return crypto.timingSafeEqual(
-    Buffer.from(generatedHash, "utf8"),
-    Buffer.from(hmac, "utf8")
-  );
+  try {
+    return crypto.timingSafeEqual(
+      Buffer.from(generatedHash, "utf8"),
+      Buffer.from(hmac, "utf8")
+    );
+  } catch {
+    return false;
+  }
 }
 
 async function initDb() {
@@ -148,48 +163,181 @@ async function shopifyGraphql(query, variables = {}) {
   return data;
 }
 
-function generateTemporarySeoHtml(keyword, urlTarget = "/collections/all") {
-  const safeKeyword = escapeHtml(keyword);
-  const safeUrl = escapeHtml(urlTarget || "/collections/all");
+async function generateSeoPageWithOpenAI(keywordRow) {
+  if (!OPENAI_API_KEY) {
+    throw new Error("OPENAI_API_KEY mancante su Render.");
+  }
 
-  return `
-    <h1>${safeKeyword}</h1>
+  const keyword = keywordRow.keyword;
+  const titoloPagina = keywordRow.titolo_pagina || keywordRow.keyword;
+  const categoria = keywordRow.categoria || "";
+  const citta = keywordRow.citta || "";
+  const urlTarget = keywordRow.url_target || "/collections/all";
 
-    <p>${safeKeyword} è una soluzione pensata per chi desidera trovare informazioni chiare, utili e orientate alla scelta più adatta alle proprie esigenze. Questa pagina nasce per offrire una panoramica completa, con indicazioni pratiche, vantaggi, contesti di utilizzo e suggerimenti per valutare con maggiore consapevolezza le alternative disponibili.</p>
+  const minLength = Number(MIN_CONTENT_LENGTH || 3000);
+  const targetLength = Math.max(minLength + 600, 3600);
 
-    <h2>Perché scegliere ${safeKeyword}</h2>
-    <p>Quando si cerca ${safeKeyword}, è importante valutare non solo l’aspetto estetico o commerciale, ma anche la qualità della proposta, la coerenza con il contesto d’uso e la possibilità di ricevere un servizio realmente adatto alle proprie necessità. Una pagina informativa ben strutturata aiuta l’utente a orientarsi meglio e consente al sito di presentare in modo ordinato prodotti, servizi o soluzioni collegate.</p>
+  const prompt = `
+Genera una pagina SEO-oriented per Shopify basata sulla keyword: "${keyword}".
 
-    <h2>Caratteristiche principali</h2>
-    <ul>
-      <li>Contenuto pensato per rispondere a una ricerca specifica dell’utente.</li>
-      <li>Struttura SEO con titolo, sezioni descrittive e collegamenti interni.</li>
-      <li>Testo organizzato per migliorare leggibilità e navigazione.</li>
-      <li>Possibilità di collegare la pagina a categorie, prodotti o servizi presenti nello store.</li>
-    </ul>
+Dati disponibili:
+- Titolo pagina suggerito: "${titoloPagina}"
+- Categoria: "${categoria}"
+- Città/località: "${citta}"
+- Link interno target: "${urlTarget}"
 
-    <h2>Quando può essere utile</h2>
-    <p>Una pagina dedicata a ${safeKeyword} può essere utile quando si vuole intercettare una ricerca precisa, valorizzare una categoria dello store o creare un percorso informativo che accompagni il visitatore verso una scelta. Questo approccio è particolarmente efficace per keyword long-tail, pagine locali, contenuti informativi e landing SEO collegate a prodotti o collezioni Shopify.</p>
+Requisiti:
+- Lingua: italiano
+- Lunghezza minima obbligatoria del solo contenuto HTML: ${targetLength} caratteri
+- Non fermarti appena superi i 3.000 caratteri: genera un testo completo, approfondito e utile
+- Tono: professionale, commerciale, utile per l’utente
+- Struttura in HTML pulito
+- Inserisci un solo H1
+- Inserisci almeno 2 H2
+- Inserisci almeno un elenco puntato
+- Inserisci una sezione FAQ con almeno 3 domande e risposte
+- Inserisci naturalmente la keyword principale
+- Inserisci varianti semantiche della keyword
+- Inserisci una call to action finale
+- Inserisci almeno un link interno verso: "${urlTarget}"
+- Non generare contenuto generico o duplicato
+- Non promettere prezzi, disponibilità, certificazioni, tempi di consegna o servizi non confermati
+- Non citare il fatto che il testo è stato generato automaticamente
+- Non usare frasi vuote come “nel mondo di oggi” o “in un mercato sempre più competitivo”
 
-    <p>La creazione di pagine specifiche permette di ampliare la presenza organica del sito, migliorare l’interlinking interno e costruire contenuti più pertinenti rispetto alle intenzioni di ricerca degli utenti. Ogni pagina dovrebbe però mantenere un contenuto unico, utile e realmente differenziato, evitando testi troppo simili o generici.</p>
+Output richiesto esclusivamente in JSON valido:
 
-    <h2>Domande frequenti</h2>
+{
+  "title": "",
+  "handle": "",
+  "meta_title": "",
+  "meta_description": "",
+  "html_body": ""
+}
+`;
 
-    <h3>Questa pagina è collegata a prodotti o collezioni?</h3>
-    <p>Sì, la pagina può essere collegata a una collezione, a una pagina interna o a un prodotto specifico dello store, così da creare un percorso di navigazione coerente.</p>
+  const response = await openai.chat.completions.create({
+    model: OPENAI_MODEL || "gpt-4.1-mini",
+    messages: [
+      {
+        role: "system",
+        content:
+          "Sei un SEO copywriter esperto per ecommerce Shopify. Generi solo JSON valido, senza markdown e senza testo extra."
+      },
+      {
+        role: "user",
+        content: prompt
+      }
+    ],
+    temperature: 0.7,
+    max_tokens: 3500,
+    response_format: {
+      type: "json_object"
+    }
+  });
 
-    <h3>Il contenuto può essere personalizzato?</h3>
-    <p>Sì, ogni contenuto può essere generato partendo da keyword, categoria, località, titolo suggerito e link interno target.</p>
+  const raw = response.choices?.[0]?.message?.content;
 
-    <h3>Perché creare pagine SEO specifiche?</h3>
-    <p>Le pagine SEO specifiche aiutano a intercettare ricerche più dettagliate e a presentare contenuti più pertinenti per l’utente, migliorando la qualità complessiva del sito.</p>
+  if (!raw) {
+    throw new Error("OpenAI non ha restituito contenuto.");
+  }
 
-    <h2>Scopri le soluzioni disponibili</h2>
-    <p>Per approfondire, visita la sezione collegata: <a href="${safeUrl}">scopri di più</a>.</p>
-  `;
+  let parsed;
+
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error(`JSON OpenAI non valido: ${raw.slice(0, 500)}`);
+  }
+
+  if (
+    !parsed.title ||
+    !parsed.handle ||
+    !parsed.meta_title ||
+    !parsed.meta_description ||
+    !parsed.html_body
+  ) {
+    throw new Error(
+      "Output OpenAI incompleto: mancano title, handle, meta_title, meta_description o html_body."
+    );
+  }
+
+  if (parsed.html_body.length < minLength) {
+    throw new Error(
+      `OpenAI ha generato un contenuto troppo corto: ${parsed.html_body.length} caratteri. Minimo richiesto: ${minLength}. Riprova la generazione.`
+    );
+  }
+
+  parsed.handle = slugify(parsed.handle || parsed.title || keyword);
+
+  return parsed;
 }
 
-async function createShopifyPage({ title, handle, body, isPublished = false }) {
+function validateGeneratedPage(generated) {
+  const minLength = Number(MIN_CONTENT_LENGTH || 3000);
+  const html = generated.html_body || "";
+
+  const h1Count = (html.match(/<h1[\s>]/gi) || []).length;
+  const h2Count = (html.match(/<h2[\s>]/gi) || []).length;
+  const linkCount = (html.match(/<a\s+[^>]*href=/gi) || []).length;
+
+  const faqHint =
+    html.toLowerCase().includes("domande frequenti") ||
+    html.toLowerCase().includes("faq");
+
+  if (html.length < minLength) {
+    throw new Error(
+      `Contenuto troppo corto: ${html.length} caratteri. Minimo richiesto: ${minLength}.`
+    );
+  }
+
+  if (!generated.title || generated.title.length < 5) {
+    throw new Error("Titolo pagina mancante o troppo corto.");
+  }
+
+  if (!generated.handle || generated.handle.length < 5) {
+    throw new Error("Handle mancante o troppo corto.");
+  }
+
+  if (!generated.meta_title || generated.meta_title.length < 20) {
+    throw new Error("Meta title mancante o troppo corto.");
+  }
+
+  if (!generated.meta_description || generated.meta_description.length < 50) {
+    throw new Error("Meta description mancante o troppo corta.");
+  }
+
+  if (h1Count !== 1) {
+    throw new Error(
+      `Numero H1 non valido: trovati ${h1Count}. Deve essercene uno solo.`
+    );
+  }
+
+  if (h2Count < 2) {
+    throw new Error(
+      `H2 insufficienti: trovati ${h2Count}. Minimo richiesto: 2.`
+    );
+  }
+
+  if (linkCount < 1) {
+    throw new Error("Manca almeno un link interno.");
+  }
+
+  if (!faqHint) {
+    throw new Error("Manca una sezione FAQ/Domande frequenti.");
+  }
+
+  return true;
+}
+
+async function createShopifyPage({
+  title,
+  handle,
+  body,
+  metaTitle = "",
+  metaDescription = "",
+  isPublished = false
+}) {
   const mutation = `
     mutation CreatePage($page: PageCreateInput!) {
       pageCreate(page: $page) {
@@ -207,13 +355,22 @@ async function createShopifyPage({ title, handle, body, isPublished = false }) {
     }
   `;
 
+  const pageInput = {
+    title,
+    handle,
+    body,
+    isPublished
+  };
+
+  if (metaTitle || metaDescription) {
+    pageInput.seo = {
+      title: metaTitle,
+      description: metaDescription
+    };
+  }
+
   const variables = {
-    page: {
-      title,
-      handle,
-      body,
-      isPublished
-    }
+    page: pageInput
   };
 
   const data = await shopifyGraphql(mutation, variables);
@@ -293,18 +450,21 @@ app.get("/auth/callback", async (req, res) => {
 
     const cleanShopDomain = cleanShop(shop);
 
-    const response = await fetch(`https://${cleanShopDomain}/admin/oauth/access_token`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Accept": "application/json"
-      },
-      body: JSON.stringify({
-        client_id: SHOPIFY_CLIENT_ID,
-        client_secret: SHOPIFY_CLIENT_SECRET,
-        code
-      })
-    });
+    const response = await fetch(
+      `https://${cleanShopDomain}/admin/oauth/access_token`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json"
+        },
+        body: JSON.stringify({
+          client_id: SHOPIFY_CLIENT_ID,
+          client_secret: SHOPIFY_CLIENT_SECRET,
+          code
+        })
+      }
+    );
 
     const data = await response.json();
 
@@ -371,7 +531,8 @@ app.get("/admin/test-create-page", requireAdminSecret, async (req, res) => {
     const page = await createShopifyPage({
       title: "Pagina test SEO Generator",
       handle: `pagina-test-seo-generator-${Date.now()}`,
-      body: "<h1>Pagina test SEO Generator</h1><p>Questa è una pagina di test creata automaticamente dall'app SEO Page Generator.</p>",
+      body:
+        "<h1>Pagina test SEO Generator</h1><p>Questa è una pagina di test creata automaticamente dall'app SEO Page Generator.</p>",
       isPublished: false
     });
 
@@ -409,6 +570,7 @@ app.get("/admin/keywords", requireAdminSecret, async (req, res) => {
           <h1>Keyword SEO Generator</h1>
 
           <h2>Aggiungi keyword</h2>
+
           <form method="POST" action="/admin/keywords?secret=${ADMIN_SECRET}">
             <p>
               <label>Keyword</label><br>
@@ -444,24 +606,40 @@ app.get("/admin/keywords", requireAdminSecret, async (req, res) => {
             <tr>
               <th>ID</th>
               <th>Keyword</th>
+              <th>Titolo pagina</th>
               <th>Stato</th>
               <th>URL Shopify</th>
+              <th>Errore</th>
               <th>Azione</th>
             </tr>
 
-            ${rows.map(row => `
+            ${rows
+              .map(
+                (row) => `
               <tr>
                 <td>${row.id}</td>
                 <td>${escapeHtml(row.keyword)}</td>
+                <td>${escapeHtml(row.titolo_pagina || "")}</td>
                 <td>${escapeHtml(row.stato)}</td>
-                <td>${row.shopify_url ? `<a href="${row.shopify_url}" target="_blank">Apri</a>` : "-"}</td>
+                <td>
+                  ${
+                    row.shopify_url
+                      ? `<a href="${row.shopify_url}" target="_blank">Apri</a>`
+                      : "-"
+                  }
+                </td>
+                <td style="max-width: 300px;">
+                  ${row.errore ? escapeHtml(row.errore) : "-"}
+                </td>
                 <td>
                   <form method="POST" action="/admin/keywords/${row.id}/generate?secret=${ADMIN_SECRET}">
                     <button type="submit">Genera pagina</button>
                   </form>
                 </td>
               </tr>
-            `).join("")}
+            `
+              )
+              .join("")}
           </table>
         </body>
       </html>
@@ -473,13 +651,7 @@ app.get("/admin/keywords", requireAdminSecret, async (req, res) => {
 
 app.post("/admin/keywords", requireAdminSecret, async (req, res) => {
   try {
-    const {
-      keyword,
-      titolo_pagina,
-      categoria,
-      citta,
-      url_target
-    } = req.body;
+    const { keyword, titolo_pagina, categoria, citta, url_target } = req.body;
 
     await pool.query(
       `
@@ -504,7 +676,9 @@ app.post("/admin/keywords", requireAdminSecret, async (req, res) => {
 
     res.redirect(`/admin/keywords?secret=${ADMIN_SECRET}`);
   } catch (error) {
-    res.status(500).send(`Errore salvataggio keyword: ${escapeHtml(error.message)}`);
+    res
+      .status(500)
+      .send(`Errore salvataggio keyword: ${escapeHtml(error.message)}`);
   }
 });
 
@@ -512,10 +686,9 @@ app.post("/admin/keywords/:id/generate", requireAdminSecret, async (req, res) =>
   const id = req.params.id;
 
   try {
-    const result = await pool.query(
-      `SELECT * FROM seo_keywords WHERE id = $1`,
-      [id]
-    );
+    const result = await pool.query(`SELECT * FROM seo_keywords WHERE id = $1`, [
+      id
+    ]);
 
     if (result.rows.length === 0) {
       return res.status(404).send("Keyword non trovata");
@@ -524,34 +697,38 @@ app.post("/admin/keywords/:id/generate", requireAdminSecret, async (req, res) =>
     const keywordRow = result.rows[0];
 
     await pool.query(
-      `UPDATE seo_keywords SET stato = 'in_generazione', updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
+      `
+      UPDATE seo_keywords
+      SET stato = 'in_generazione',
+          errore = null,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id = $1
+      `,
       [id]
     );
 
-    const title = keywordRow.titolo_pagina || keywordRow.keyword;
-    const handle = slugify(title);
-    const body = generateTemporarySeoHtml(keywordRow.keyword, keywordRow.url_target);
+    const generated = await generateSeoPageWithOpenAI(keywordRow);
 
-    const minimumLength = Number(MIN_CONTENT_LENGTH || 3000);
-
-    if (body.length < minimumLength) {
-      throw new Error(`Contenuto troppo corto: ${body.length} caratteri. Minimo richiesto: ${minimumLength}.`);
-    }
+    validateGeneratedPage(generated);
 
     const page = await createShopifyPage({
-      title,
-      handle: `${handle}-${Date.now()}`,
-      body,
+      title: generated.title,
+      handle: `${generated.handle}-${Date.now()}`,
+      body: generated.html_body,
+      metaTitle: generated.meta_title,
+      metaDescription: generated.meta_description,
       isPublished: false
     });
 
-    const shopifyUrl = `https://${cleanShop(SHOPIFY_STORE_DOMAIN)}/pages/${page.handle}`;
+    const shopifyUrl = `https://${cleanShop(SHOPIFY_STORE_DOMAIN)}/pages/${
+      page.handle
+    }`;
 
     await pool.query(
       `
       UPDATE seo_keywords
       SET
-        stato = 'pubblicata',
+        stato = 'bozza_generata',
         shopify_page_id = $1,
         shopify_url = $2,
         errore = null,
@@ -575,7 +752,9 @@ app.post("/admin/keywords/:id/generate", requireAdminSecret, async (req, res) =>
       [error.message, id]
     );
 
-    res.status(500).send(`Errore generazione pagina: ${escapeHtml(error.message)}`);
+    res
+      .status(500)
+      .send(`Errore generazione pagina: ${escapeHtml(error.message)}`);
   }
 });
 
